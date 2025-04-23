@@ -1,0 +1,241 @@
+//@version=5
+strategy('PowerX with Metacognition (DMM Strategy v2)', // ストラテジー名を変更
+         overlay=true,
+         initial_capital=10000,
+         commission_value=0.0,
+         slippage=0,
+         calc_on_order_fills=false,
+         calc_on_every_tick=false)
+
+// --- 定数 ---
+string LONG_ENTRY_ID = 'Long Entry'
+string SHORT_ENTRY_ID = 'Short Entry'
+string LONG_EXIT_COMMENT = 'Long Exit Signal'
+string SHORT_EXIT_COMMENT = 'Short Exit Signal'
+string LONG_SLTP_EXIT_ID = 'Long SL/TP'
+string SHORT_SLTP_EXIT_ID = 'Short SL/TP'
+
+// --- 分解管理モンテカルロ法 状態変数 ---
+var int[] monteCarloSequence = array.from(0, 1)
+var int monteCarloStock = 0
+var bool isInGoodmanPhase = false
+var int goodmanWinStreak = 0
+var float lastBetAmount = 1.0
+
+// --- インプット (変更なし) ---
+bool isLongsAllowed = input.bool(true, 'ロングエントリーを許可')
+bool isShortsAllowed = input.bool(true, 'ショートエントリーを許可')
+float stopLossMultiplier = input.float(1.5, 'ストップロス ATR倍率', 0.1, 10, 0.1, group='SL/TP Settings')
+float profitTargetMultiplier = input.float(3.0, 'プロフィットターゲット ATR倍率', 0.1, 10, 0.1, group='SL/TP Settings')
+int atrPeriod = input.int(14, 'ATR Period for SL/TP', minval=1, group='SL/TP Settings')
+int rsiPeriod = input.int(7, 'RSI Period', minval=1, group='Indicators')
+int stochKPeriod = input.int(14, 'Stoch %K Period', minval=1, group='Indicators')
+int stochSmoothPeriod = input.int(3, 'Stoch Smooth Period', minval=1, group='Indicators')
+int macdFastPeriod = input.int(12, 'MACD Fast Period', minval=1, group='Indicators')
+int macdSlowPeriod = input.int(26, 'MACD Slow Period', minval=1, group='Indicators')
+int macdSignalPeriod = input.int(9, 'MACD Signal Period', minval=1, group='Indicators')
+float superTrendMultiplier = input.float(4.0, 'Super Trend Multiplier', minval=1, step=0.1, group='SuperTrend')
+int superTrendPeriod = input.int(10, 'Super Trend Period', minval=1, group='SuperTrend')
+string higherTimeframe = input.timeframe('60', '上位時間足', group='Higher Timeframe')
+
+// --- インジケーター計算 (変更なし) ---
+float atrValue = ta.atr(atrPeriod)
+float rsiVal = ta.rsi(close, rsiPeriod)
+float stochKVal = ta.sma(ta.stoch(close, high, low, stochKPeriod), stochSmoothPeriod)
+[macdLine, signalLine, histLine] = ta.macd(close, macdFastPeriod, macdSlowPeriod, macdSignalPeriod)
+[superTrendVal, superTrendDirection] = ta.supertrend(superTrendMultiplier, superTrendPeriod)
+bool isTrendUp = superTrendDirection < 0
+bool isTrendDown = superTrendDirection > 0
+
+// --- 上位時間足データ（リペイント対策） (変更なし) ---
+f_rsi(src, len) => ta.rsi(src, len)
+f_stoch(k, smooth) => ta.sma(ta.stoch(close, high, low, k), smooth)
+f_secureSecurity(_symbol, _res, _src) => request.security(_symbol, _res, _src[1], lookahead=barmerge.lookahead_off)
+float higherRsi = f_secureSecurity(syminfo.tickerid, higherTimeframe, f_rsi(close, rsiPeriod))
+float higherStoch = f_secureSecurity(syminfo.tickerid, higherTimeframe, f_stoch(stochKPeriod, stochSmoothPeriod))
+
+// --- シグナル条件 (変更なし) ---
+bool greenBarCondition = rsiVal > 50 and stochKVal > 50 and histLine > 0
+bool redBarCondition = rsiVal < 50 and stochKVal < 50 and histLine < 0
+bool blackBarCondition = not greenBarCondition and not redBarCondition
+bool higherTFConditionLong = higherRsi > 50
+bool higherTFConditionShort = higherRsi < 50
+bool longEntryCondition = greenBarCondition and not greenBarCondition[1] and isLongsAllowed and isTrendUp and higherTFConditionLong
+bool shortEntryCondition = redBarCondition and not redBarCondition[1] and isShortsAllowed and isTrendDown and higherTFConditionShort
+bool longExitSignal = (blackBarCondition or redBarCondition) and strategy.position_size > 0
+bool shortExitSignal = (blackBarCondition or greenBarCondition) and strategy.position_size < 0
+bool cancelLongOrder = not (greenBarCondition and isLongsAllowed and isTrendUp and higherTFConditionLong)
+bool cancelShortOrder = not (redBarCondition and isShortsAllowed and isTrendDown and higherTFConditionShort)
+
+// --- 視覚化 (変更なし) ---
+color barColor = greenBarCondition ? color.new(color.green, 0) : redBarCondition ? color.new(color.red, 0) : color.new(color.gray, 0)
+barcolor(barColor)
+color bgColorHigherTF = higherTFConditionLong ? color.new(color.green, 90) : higherTFConditionShort ? color.new(color.red, 90) : na
+bgcolor(bgColorHigherTF)
+plot(superTrendVal, "SuperTrend", color = isTrendUp ? color.green : color.red, style=plot.style_linebr)
+
+
+// --- 分解管理モンテカルロ法 関数 ---
+
+// オリジナルグッドマン法のベット額を返す
+f_getGoodmanBet(streak) =>
+    bet = 1
+    if streak == 2
+        bet := 2
+    else if streak == 3
+        bet := 3
+    else if streak >= 4
+        bet := 5
+    bet
+
+// 次のベット額と、(もしあれば)更新されたストック数を計算して返す
+f_calculateBetAmountAndStock(currentSequence, currentStock, currentIsGoodman, currentGoodmanStreak) =>
+    betAmount = 1.0
+    newStock = currentStock // ストックの変更がない場合のデフォルト値
+    tempSequence = array.copy(currentSequence) // 配列をコピーして関数内で変更
+
+    if currentIsGoodman
+        betAmount := f_getGoodmanBet(currentGoodmanStreak)
+    else
+        seqSize = array.size(tempSequence)
+        if seqSize > 0
+            // ストック消費ロジック (ベット額計算前)
+            if seqSize >= 1 and array.get(tempSequence, 0) > 0 and currentStock > 0
+                array.set(tempSequence, 0, 0) // 左端を0に (コピーした配列を変更)
+                newStock := currentStock - 1 // 更新後のストック数を計算
+
+            // ベット額計算 (モンテカルロ法)
+            // 注意: ストック消費が行われた場合、変更後のtempSequenceで計算
+            seqSizeAfterStockConsume = array.size(tempSequence) // サイズは変わらないはず
+            if seqSizeAfterStockConsume >= 2
+                betAmount := float(array.get(tempSequence, 0) + array.get(tempSequence, seqSizeAfterStockConsume - 1))
+            else if seqSizeAfterStockConsume == 1
+                betAmount := float(array.get(tempSequence, 0))
+        else
+            // 数列が空の場合 (通常はGoodmanPhaseに入るはずだが念のため)
+            // この関数はベット額計算のみ責務を持つべきだが、便宜上ここで状態遷移を示唆
+            // 実際の状態遷移は f_updateMonteCarloState で行う
+            betAmount := 1.0 // 初期ベット
+
+    // 関数はベット額と更新後のストック数をタプルで返す
+    [math.max(1.0, betAmount), newStock]
+
+// トレード結果に基づき、更新後の状態変数をタプルで返す
+f_getUpdatedMonteCarloState(isWin, betAmount, currentSequence, currentStock, currentIsGoodman, currentGoodmanStreak) =>
+    // 状態変数をコピーして変更する
+    newSequence = array.copy(currentSequence)
+    newStock = currentStock
+    newIsGoodman = currentIsGoodman
+    newGoodmanStreak = currentGoodmanStreak
+
+    if isWin
+        if currentIsGoodman
+            profit = betAmount
+            if profit > 1
+                newStock := currentStock + int(profit - 1)
+            newGoodmanStreak := currentGoodmanStreak + 1
+        else
+            seqSize = array.size(newSequence)
+            if seqSize >= 2
+                array.shift(newSequence)
+                array.pop(newSequence)
+            else if seqSize == 1
+                array.clear(newSequence)
+
+            if array.size(newSequence) == 0
+                newIsGoodman := true
+                newGoodmanStreak := 0
+    else // 負けの場合
+        if currentIsGoodman
+            newIsGoodman := false
+            array.clear(newSequence)
+            array.push(newSequence, int(betAmount))
+        else
+            array.push(newSequence, int(betAmount))
+
+    // 更新後の状態をタプルで返す
+    [newSequence, newStock, newIsGoodman, newGoodmanStreak]
+
+
+// --- 注文価格とSL/TP計算 (変更なし) ---
+float longEntryPrice = high + syminfo.mintick
+float shortEntryPrice = low - syminfo.mintick
+float longStopLoss = longEntryPrice - stopLossMultiplier * atrValue
+float longProfitTarget = longEntryPrice + profitTargetMultiplier * atrValue
+float shortStopLoss = shortEntryPrice + stopLossMultiplier * atrValue
+float shortProfitTarget = shortEntryPrice - profitTargetMultiplier * atrValue
+
+// --- ストラテジー実行 ---
+
+// グローバル変数を更新する処理はメインスコープで行う
+
+// トレード結果をチェックして状態を更新
+if strategy.closedtrades > strategy.closedtrades[1]
+    isLastTradeWin = strategy.closedtrades.profit(strategy.closedtrades - 1) > 0
+    // 更新後の状態を取得
+    [updatedSequence, updatedStock, updatedIsGoodman, updatedGoodmanStreak] =
+         f_getUpdatedMonteCarloState(isLastTradeWin, lastBetAmount, monteCarloSequence, monteCarloStock, isInGoodmanPhase, goodmanWinStreak)
+    // グローバル変数を更新
+    monteCarloSequence := updatedSequence
+    monteCarloStock := updatedStock
+    isInGoodmanPhase := updatedIsGoodman
+    goodmanWinStreak := updatedGoodmanStreak
+
+// 次のベット額と、ストック消費後のストック数を計算
+[calculatedBetAmount, updatedStockAfterConsume] =
+     f_calculateBetAmountAndStock(monteCarloSequence, monteCarloStock, isInGoodmanPhase, goodmanWinStreak)
+
+// ストック消費が行われた場合はグローバル変数を更新
+// (f_calculateBetAmountAndStockは状態を変更せず値を返すだけなので、ここで更新)
+if updatedStockAfterConsume != monteCarloStock
+    monteCarloStock := updatedStockAfterConsume
+
+// 現在のバーで使用するベット額
+float currentBetAmount = calculatedBetAmount
+
+// ベット額を次のバーのために保持
+if barstate.isconfirmed
+    lastBetAmount := currentBetAmount
+
+// デバッグ用プロット (必要に応じて)
+// plot(monteCarloStock, "Stock", color.blue)
+// plot(array.size(monteCarloSequence), "Sequence Size", color.orange)
+// plot(currentBetAmount, "Bet Amount", color.purple)
+// plotchar(isInGoodmanPhase, "IsGoodman", "G", location.top)
+
+
+// 注文数量 (ベット額をそのまま数量として使用)
+float qtyToTrade = currentBetAmount
+
+// ロングエントリー
+if (longEntryCondition and strategy.position_size == 0)
+    strategy.entry(LONG_ENTRY_ID, strategy.long, qty=qtyToTrade, stop=longEntryPrice)
+
+// ロングSL/TP設定
+if (strategy.position_size > 0)
+    strategy.exit(LONG_SLTP_EXIT_ID, from_entry=LONG_ENTRY_ID, limit=longProfitTarget, stop=longStopLoss)
+
+// ロング決済シグナル
+if (longExitSignal)
+    strategy.close(LONG_ENTRY_ID, comment=LONG_EXIT_COMMENT)
+
+// 未約定のロングエントリー注文キャンセル
+if cancelLongOrder
+    strategy.cancel(LONG_ENTRY_ID)
+
+
+// ショートエントリー
+if (shortEntryCondition and strategy.position_size == 0)
+    strategy.entry(SHORT_ENTRY_ID, strategy.short, qty=qtyToTrade, stop=shortEntryPrice)
+
+// ショートSL/TP設定
+if (strategy.position_size < 0)
+    strategy.exit(SHORT_SLTP_EXIT_ID, from_entry=SHORT_ENTRY_ID, limit=shortProfitTarget, stop=shortStopLoss)
+
+// ショート決済シグナル
+if (shortExitSignal)
+    strategy.close(SHORT_ENTRY_ID, comment=SHORT_EXIT_COMMENT)
+
+// 未約定のショートエントリー注文キャンセル
+if cancelShortOrder
+    strategy.cancel(SHORT_ENTRY_ID)
